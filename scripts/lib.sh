@@ -54,7 +54,9 @@ cost_flag_check() {
 
 # Echoes CREATE if the stack doesn't exist yet (or is stuck in
 # REVIEW_IN_PROGRESS from an abandoned first change set), else UPDATE.
-# Required by `create-change-set --change-set-type`.
+# Required by `create-change-set --change-set-type`. Exits with a clear
+# message if the stack is in ROLLBACK_COMPLETE, since CloudFormation refuses
+# an UPDATE change set against that status -- it must be deleted first.
 changeset_type_for() {
   local stack="$1"
   local status
@@ -62,6 +64,11 @@ changeset_type_for() {
     --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "")"
   if [ -z "$status" ] || [ "$status" = "REVIEW_IN_PROGRESS" ]; then
     echo "CREATE"
+  elif [ "$status" = "ROLLBACK_COMPLETE" ]; then
+    echo "Stack $stack is in ROLLBACK_COMPLETE (its first create failed). Delete it before retrying:" >&2
+    echo "  aws cloudformation delete-stack --region $AWS_REGION --stack-name $stack" >&2
+    echo "  aws cloudformation wait stack-delete-complete --region $AWS_REGION --stack-name $stack" >&2
+    exit 1
   else
     echo "UPDATE"
   fi
@@ -125,8 +132,10 @@ create_changeset() {
 }
 
 # Executes a change set by name, waits for the stack to settle, and prints
-# outputs on success. Exits 1 if the stack doesn't land in a *_COMPLETE
-# status.
+# outputs on success. Exits 1 unless the stack lands in CREATE_COMPLETE or
+# UPDATE_COMPLETE -- ROLLBACK_COMPLETE/UPDATE_ROLLBACK_COMPLETE also match a
+# bare `*COMPLETE` glob, so they must be excluded explicitly or a failed
+# deploy gets reported as a success.
 execute_changeset() {
   local stack="$1" changeset_name="$2"
   echo "==> Executing change set $changeset_name on $stack"
@@ -138,12 +147,12 @@ execute_changeset() {
   echo "==> Stack status: $status"
 
   case "$status" in
-    *COMPLETE)
+    CREATE_COMPLETE|UPDATE_COMPLETE)
       echo "==> Outputs:"
       aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$stack" --query 'Stacks[0].Outputs' --output table
       ;;
     *)
-      echo "Stack did not complete successfully, check the console/CLI events for $stack." >&2
+      echo "Stack did not complete successfully (status: $status), check the console/CLI events for $stack." >&2
       exit 1
       ;;
   esac

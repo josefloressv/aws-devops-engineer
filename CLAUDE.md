@@ -22,6 +22,24 @@ regardless of the language the conversation happens in.
   tags propagate to resources that support tagging — don't repeat tags per-resource unless a
   resource type requires it, e.g. `AWS::SSM::Parameter`).
 
+## Known gotchas (learned from past scenario runs)
+
+- `AWS::EC2::Instance.IamInstanceProfile` takes the instance profile **name**, not its ARN
+  (passing the ARN fails with `Invalid IAM Instance Profile name`). `base/iam-baseline` only
+  exports `Ec2InstanceProfileArn` — derive the name from it in the scenario template with
+  `!Select [1, !Split ["/", !ImportValue dop-lab-base-iam-baseline-Ec2InstanceProfileArn]]`
+  rather than adding a Name export to the base stack.
+- `AWS::SSM::Association` rate-based `ScheduleExpression` has a hard 30-minute minimum
+  (`rate(5 minutes)` etc. is rejected at deploy time with `InvalidSchedule`).
+- If an `AWS::EC2::Instance` resource sits at `CREATE_IN_PROGRESS` for several minutes with no
+  new stack events, suspect a transient `AccessDenied` (e.g. an SCP that changed mid-deploy) —
+  the resource handler retries silently without posting intermediate events. Check with
+  `aws ec2 run-instances --dry-run` using the same parameters to see the real-time permission
+  result before assuming the stack is actually stuck.
+- If a stack ends up in `ROLLBACK_COMPLETE`, `scripts/lab-plan.sh`/`base-plan.sh` will now stop
+  and tell you to delete it first — CloudFormation refuses an `UPDATE` change set against that
+  status.
+
 ## Deploy workflow — auto-apply by default, pause only for cost-flagged resources
 
 Jose isn't cost-sensitive (AWS promotional credit, see Cost section) and wants speed over a
