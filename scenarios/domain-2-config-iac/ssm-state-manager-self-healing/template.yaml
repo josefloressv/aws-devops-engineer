@@ -13,11 +13,10 @@ Parameters:
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
   InstanceType:
     Type: String
-    Default: t2.micro
-    AllowedValues: [t2.micro]
+    Default: t3.small
   AssociationScheduleExpression:
     Type: String
-    Default: rate(5 minutes)
+    Default: rate(30 minutes) # SSM hard minimum for rate-based associations
 
 Resources:
   InstanceSecurityGroup:
@@ -37,7 +36,9 @@ Resources:
       SubnetId: !ImportValue dop-lab-base-network-PublicSubnet1Id
       SecurityGroupIds:
         - !Ref InstanceSecurityGroup
-      IamInstanceProfile: !ImportValue dop-lab-base-iam-baseline-Ec2InstanceProfileArn
+      # AWS::EC2::Instance.IamInstanceProfile takes the profile *name*, not the ARN
+      # base/iam-baseline only exports the ARN, so derive the name from it here.
+      IamInstanceProfile: !Select [1, !Split ["/", !ImportValue dop-lab-base-iam-baseline-Ec2InstanceProfileArn]]
       Tags:
         - Key: Name
           Value: dop-lab-d2-ssm-state-manager-self-healing-instance
