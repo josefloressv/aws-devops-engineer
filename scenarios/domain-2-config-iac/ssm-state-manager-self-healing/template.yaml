@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  dop-c02-lab scenario: ssm-state-manager-self-healing (domain-2-config-iac).
+  Single EC2 instance running a marker systemd service, an SSM Command
+  document that ensures the service is started, and an SSM State Manager
+  Association that re-applies the document on a fixed schedule. Used to
+  observe whether State Manager (vs. one-shot Run Command / Automation /
+  Inventory) actually self-heals drift without manual re-trigger.
+
+Parameters:
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues: [t2.micro]
+  AssociationScheduleExpression:
+    Type: String
+    Default: rate(5 minutes)
+
+Resources:
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: dop-lab outbound-only SG (no inbound; shell access via Session Manager)
+      VpcId: !ImportValue dop-lab-base-network-VpcId
+      Tags:
+        - Key: Name
+          Value: dop-lab-d2-ssm-state-manager-self-healing-sg
+
+  Ec2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !ImportValue dop-lab-base-network-PublicSubnet1Id
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !ImportValue dop-lab-base-iam-baseline-Ec2InstanceProfileArn
+      Tags:
+        - Key: Name
+          Value: dop-lab-d2-ssm-state-manager-self-healing-instance
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          cat <<'UNIT' > /etc/systemd/system/dop-lab-marker.service
+          [Unit]
+          Description=dop-lab desired-state marker service
+
+          [Service]
+          ExecStart=/usr/bin/sleep infinity
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now dop-lab-marker.service
+
+  EnsureMarkerServiceDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: dop-lab-d2-ssm-state-manager-self-healing-ensure-marker
+      DocumentType: Command
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Ensures the dop-lab-marker systemd service is running. This is the
+          desired-state check applied by the State Manager association under
+          test, and the same document used for the one-shot manual Run
+          Command comparison step.
+        mainSteps:
+          - action: aws:runShellScript
+            name: ensureMarkerServiceRunning
+            inputs:
+              runCommand:
+                - systemctl start dop-lab-marker.service
+                - systemctl is-active dop-lab-marker.service
+      Tags:
+        - Key: Name
+          Value: dop-lab-d2-ssm-state-manager-self-healing-document
+
+  MarkerAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: dop-lab-d2-ssm-state-manager-self-healing-association
+      Name: !Ref EnsureMarkerServiceDocument
+      ScheduleExpression: !Ref AssociationScheduleExpression
+      ApplyOnlyAtCronInterval: false
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref Ec2Instance
+      Tags:
+        - Key: Name
+          Value: dop-lab-d2-ssm-state-manager-self-healing-association
+
+Outputs:
+  InstanceId:
+    Value: !Ref Ec2Instance
+  DocumentName:
+    Value: !Ref EnsureMarkerServiceDocument
+  AssociationId:
+    Value: !Ref MarkerAssociation

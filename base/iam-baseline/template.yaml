@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  dop-c02-lab base stack: reusable IAM permission boundary and baseline
+  service roles. Does not touch AWS Organizations/SCPs -- those require an
+  existing Organization and are modeled per-scenario under
+  scenarios/domain-6-security/.
+
+Resources:
+  LabPermissionBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Example permission boundary for dop-c02-lab scenarios (denies IAM/Org escalation, allows everything else).
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyBoundaryEscalation
+            Effect: Deny
+            Action:
+              - iam:CreateUser
+              - iam:CreatePolicy
+              - iam:CreatePolicyVersion
+              - iam:DeleteUserPermissionsBoundary
+              - iam:DeleteRolePermissionsBoundary
+              - organizations:*
+              - account:*
+            Resource: "*"
+          - Sid: AllowEverythingElse
+            Effect: Allow
+            Action: "*"
+            Resource: "*"
+
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2InstanceRole
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+Outputs:
+  PermissionBoundaryArn:
+    Value: !Ref LabPermissionBoundary
+    Export:
+      Name: dop-lab-base-iam-baseline-PermissionBoundaryArn
+  Ec2InstanceRoleArn:
+    Value: !GetAtt Ec2InstanceRole.Arn
+    Export:
+      Name: dop-lab-base-iam-baseline-Ec2InstanceRoleArn
+  Ec2InstanceProfileArn:
+    Value: !GetAtt Ec2InstanceProfile.Arn
+    Export:
+      Name: dop-lab-base-iam-baseline-Ec2InstanceProfileArn
+  LambdaExecutionRoleArn:
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: dop-lab-base-iam-baseline-LambdaExecutionRoleArn
+  EcsTaskExecutionRoleArn:
+    Value: !GetAtt EcsTaskExecutionRole.Arn
+    Export:
+      Name: dop-lab-base-iam-baseline-EcsTaskExecutionRoleArn

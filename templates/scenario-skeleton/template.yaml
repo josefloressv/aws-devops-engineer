@@ -1,0 +1,23 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "dop-c02-lab scenario: {{SCENARIO_SLUG}} ({{DOMAIN_FOLDER}})"
+
+Parameters:
+  ScenarioName:
+    Type: String
+    Default: "{{SCENARIO_SLUG}}"
+
+Resources:
+  # Placeholder so the template is valid out of the box. Replace with the
+  # real resources this scenario needs, then delete this marker.
+  ScenarioMarker:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Value: !Ref ScenarioName
+      Tags:
+        Project: dop-c02-lab
+        Scenario: "{{SCENARIO_SLUG}}"
+
+Outputs:
+  ScenarioMarkerName:
+    Value: !Ref ScenarioMarker

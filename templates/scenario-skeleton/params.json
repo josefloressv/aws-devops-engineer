@@ -1,0 +1,6 @@
+[
+  {
+    "ParameterKey": "ScenarioName",
+    "ParameterValue": "{{SCENARIO_SLUG}}"
+  }
+]

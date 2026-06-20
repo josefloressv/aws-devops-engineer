@@ -1,0 +1,53 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  dop-c02-lab base stack: shared S3 bucket (7-day lifecycle expiry) and
+  CloudWatch Log Group for scenario log/evidence output. CloudTrail is
+  intentionally NOT created here -- a dedicated trail is its own scenario
+  under scenarios/domain-4-monitoring/ to avoid creating a duplicate
+  account-wide trail by accident.
+
+Resources:
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+            NoncurrentVersionExpirationInDays: 7
+
+  CentralLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /dop-lab/central
+      RetentionInDays: 7
+
+Outputs:
+  LogsBucketName:
+    Value: !Ref LogsBucket
+    Export:
+      Name: dop-lab-base-logging-baseline-LogsBucketName
+  LogsBucketArn:
+    Value: !GetAtt LogsBucket.Arn
+    Export:
+      Name: dop-lab-base-logging-baseline-LogsBucketArn
+  CentralLogGroupName:
+    Value: !Ref CentralLogGroup
+    Export:
+      Name: dop-lab-base-logging-baseline-CentralLogGroupName
+  CentralLogGroupArn:
+    Value: !GetAtt CentralLogGroup.Arn
+    Export:
+      Name: dop-lab-base-logging-baseline-CentralLogGroupArn
