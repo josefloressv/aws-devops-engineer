@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Monthly AWS promotional credit burn monitor. An EventBridge rule invokes a
+  Lambda that derives credit consumption from Cost Explorer and emails a
+  utilization projection via SNS, warning when the credit is on track to
+  expire unused. Deploy to the organization's payer account -- credits pool
+  there, and Cost Explorer only reports org-wide data from the management
+  account.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Address that receives the monthly report (must confirm the SNS subscription by email).
+    AllowedPattern: ".+@.+\\..+"
+  CreditName:
+    Type: String
+    Default: AWS Community Builders 2026 Renewal Credit
+  CreditTotal:
+    Type: Number
+    Default: 500
+    Description: Issued credit amount in USD.
+  CreditStart:
+    Type: String
+    Default: "2026-08-01"
+    Description: Redemption date (YYYY-MM-DD). Consumption is summed from here.
+    AllowedPattern: "\\d{4}-\\d{2}-\\d{2}"
+  CreditExpiry:
+    Type: String
+    Default: "2027-11-30"
+    Description: Expiration date (YYYY-MM-DD).
+    AllowedPattern: "\\d{4}-\\d{2}-\\d{2}"
+  WarnThresholdPercent:
+    Type: Number
+    Default: 50
+    MinValue: 0
+    MaxValue: 100
+    Description: Warn when projected utilization at expiry falls below this percentage.
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 13 1 * ? *)
+    Description: >-
+      When to run. Default is the 1st of each month at 13:00 UTC
+      (07:00 America/El_Salvador).
+
+Resources:
+  ReportTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AWS credit burn report
+
+  ReportSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ReportTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  MonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: credit-monitor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Cost Explorer actions do not support resource-level permissions.
+              - Effect: Allow
+                Action: ce:GetCostAndUsage
+                Resource: "*"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ReportTopic
+
+  MonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Derives credit consumption from Cost Explorer and emails a projection.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt MonitorRole.Arn
+      Environment:
+        Variables:
+          TOPIC: !Ref ReportTopic
+          NAME: !Ref CreditName
+          TOTAL: !Ref CreditTotal
+          START: !Ref CreditStart
+          EXPIRY: !Ref CreditExpiry
+          WARN: !Ref WarnThresholdPercent
+      Code:
+        ZipFile: |
+          import os, boto3
+          from datetime import date, timedelta
+
+          ce = boto3.client("ce")
+          sns = boto3.client("sns")
+
+          def handler(event, context):
+              T = float(os.environ["TOTAL"])
+              S = date.fromisoformat(os.environ["START"])
+              X = date.fromisoformat(os.environ["EXPIRY"])
+              N, A = os.environ["NAME"], os.environ["TOPIC"]
+              W = float(os.environ["WARN"])
+              t = date.today()
+              end = max(t, S + timedelta(days=1))
+
+              def q(rt, grp=None):
+                  a = dict(
+                      TimePeriod={"Start": S.isoformat(), "End": end.isoformat()},
+                      Granularity="MONTHLY", Metrics=["UnblendedCost"],
+                      Filter={"Dimensions": {"Key": "RECORD_TYPE", "Values": [rt]}})
+                  if grp:
+                      a["GroupBy"] = [{"Type": "DIMENSION", "Key": grp}]
+                  return ce.get_cost_and_usage(**a)["ResultsByTime"]
+
+              # Credits are reported as negative cost; flip the sign.
+              used = sum(abs(float(r["Total"]["UnblendedCost"]["Amount"]))
+                         for r in q("Credit") if r.get("Total"))
+              svc = {}
+              for r in q("Usage", "SERVICE"):
+                  for g in r.get("Groups", []):
+                      k = g["Keys"][0]
+                      svc[k] = svc.get(k, 0) + float(g["Metrics"]["UnblendedCost"]["Amount"])
+
+              rem = max(T - used, 0)
+              ed, rd = max((t - S).days, 1), (X - t).days
+              bd = used / ed
+              proj = used + bd * max(rd, 0)
+              waste = max(T - proj, 0)
+              need = rem / max(rd / 30.44, 0.01)
+              pct = proj / T * 100
+              top = "\n".join(f"  {k}: ${v:,.2f}" for k, v in
+                              sorted(svc.items(), key=lambda x: -x[1])[:8] if v > 0)
+
+              m = (f"{N}\n"
+                   f"Issued ${T:,.2f} | Redeemed {S} | Expires {X} ({rd} days left)\n\n"
+                   f"Used       ${used:,.2f} ({used / T * 100:.1f}%)\n"
+                   f"Remaining  ${rem:,.2f}\n"
+                   f"Burn rate  ${bd * 30.44:,.2f}/month\n\n"
+                   f"PROJECTION AT CURRENT BURN\n"
+                   f"Consumed by expiry  ${proj:,.2f} ({pct:.0f}%)\n"
+                   f"EXPIRING UNUSED     ${waste:,.2f}\n"
+                   f"Needed to use all   ${need:,.2f}/month\n\n"
+                   f"TOP SERVICES\n{top or '  (none)'}\n")
+
+              if rd < 0:
+                  sub = f"[EXPIRED] {N}"
+              elif pct < W:
+                  sub = f"[WARN] AWS credit: ${waste:,.0f} on track to expire unused"
+                  m += (f"\nWARNING: on track to waste ${waste:,.2f}.\n"
+                        f"Leave labs standing between sessions (a NAT Gateway is ~$33/mo)\n"
+                        f"or run the RDS / EKS / Aurora scenarios.\n")
+                  if rd < 90:
+                      m += f"Only {rd} days left -- last realistic window.\n"
+              else:
+                  sub = f"[OK] AWS credit: {pct:.0f}% projected utilization"
+
+              m += ("\nDerived from Cost Explorer, not the credit ledger.\n"
+                    "Confirm at Billing console -> Credits (no API exposes the real balance).\n")
+              sns.publish(TopicArn=A, Subject=sub[:100], Message=m)
+              return {"used": used, "projected": proj, "pct": pct}
+
+  MonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${MonitorFunction}"
+      RetentionInDays: 30
+
+  MonthlySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Monthly trigger for the AWS credit burn monitor.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: credit-monitor
+          Arn: !GetAtt MonitorFunction.Arn
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlySchedule.Arn
+
+Outputs:
+  TopicArn:
+    Description: SNS topic carrying the monthly report.
+    Value: !Ref ReportTopic
+  FunctionName:
+    Description: Invoke manually with `aws lambda invoke --function-name <this> /dev/stdout`.
+    Value: !Ref MonitorFunction

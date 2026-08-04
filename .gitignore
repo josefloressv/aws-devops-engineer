@@ -1,3 +1,6 @@
 .DS_Store
 .lastchangeset
 *.swp
+
+# Account IDs and profile names -- see .env.local.example
+.env.local
