@@ -16,8 +16,18 @@ regardless of the language the conversation happens in.
 - Reusable infra (VPC, IAM baseline, logging baseline) lives under `base/` and is consumed by
   scenario stacks via `Fn::ImportValue` cross-stack exports, not nested stacks (avoids needing
   an S3 bucket to host nested templates).
+- Account-level tooling that is not a lab building block lives under `ops/` and deploys to the
+  **payer (management) account**, not the sandbox. Use
+  `make ops-apply NAME=<name> PARAMS="Key=Value ..."`; `scripts/ops-apply.sh` pins
+  `AWS_PROFILE` to the payer profile rather than using ambient credentials, and aborts if the
+  caller resolves to any other account.
+- This repo is public, so account IDs and profile names are **never** committed. They live in
+  `.env.local` (gitignored, see `.env.local.example`) as `PAYER_ACCOUNT_ID` and
+  `PAYER_PROFILE_DEFAULT`, which `scripts/lib.sh` sources. Use those variable names in docs and
+  comments instead of literal IDs.
 - Stack naming: scenarios = `dop-lab-<domain-abbrev>-<scenario-slug>` (e.g.
-  `dop-lab-d6-iam-boundary-vs-scp`); base stacks = `dop-lab-base-<name>`.
+  `dop-lab-d6-iam-boundary-vs-scp`); base stacks = `dop-lab-base-<name>`; ops stacks =
+  `dop-ops-<name>`.
 - Every stack is created with `--tags Project=dop-c02-lab Domain=<n> Scenario=<slug>` (stack
   tags propagate to resources that support tagging — don't repeat tags per-resource unless a
   resource type requires it, e.g. `AWS::SSM::Parameter`).
@@ -65,12 +75,26 @@ Free-tier-first. Flag any resource type with non-trivial cost (NAT Gateway, RDS,
 ElastiCache, Redshift, OpenSearch/Elasticsearch, MSK, Transit Gateway, Global Accelerator,
 Direct Connect) **before** creating it, even inside a change-set plan step.
 
-Jose has a $500 AWS Promotional Credit (Credit ID `10063119089`) that covers nearly every
-service used in this repo's labs — including RDS, EKS, ElastiCache, Redshift, OpenSearch, MSK,
-Global Accelerator, Direct Connect, and VPC/NAT Gateway. **AWS Transit Gateway is the one
-cost-flagged type NOT covered by this credit** — if a scenario ever needs Transit Gateway,
-call that out explicitly (its hourly attachment + data processing charges will hit the actual
-bill, not the credit) before applying.
+Jose has a $500 **AWS Community Builders 2026 Renewal Credit**, redeemed 2026-08-01 into the
+organization's management account (`PAYER_ACCOUNT_ID`) and expiring **2027-11-30**. Credit
+sharing is activated for all three accounts in the org, so the credit also covers usage in the
+lab and sandbox member accounts — labs deployed to any account draw from the same pool.
+
+The credit covers nearly every service used in this repo's labs, including RDS, EKS,
+ElastiCache, Redshift, OpenSearch, MSK, Global Accelerator, Direct Connect, and VPC/NAT
+Gateway. **AWS Transit Gateway is the one cost-flagged type NOT covered** — if a scenario ever
+needs Transit Gateway, call that out explicitly (its hourly attachment + data processing
+charges will hit the actual bill, not the credit) before applying. AWS Marketplace purchases
+are also uncovered — avoid Marketplace AMIs in scenario templates.
+
+The full authoritative list of covered services is in
+[`docs/credit-applicable-services.md`](docs/credit-applicable-services.md). Check it before
+introducing a service this repo hasn't used before.
+
+**Credit balances are not queryable via CLI or API** — only the Billing console's Credits page
+shows them. Three prior credits (2024-2026) expired with $971.02 unused because org-wide spend
+runs well under $1/month, so treat a low burn rate as the expected failure mode, not a
+surprise.
 
 ## Evidence, not answers
 

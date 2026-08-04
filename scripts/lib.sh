@@ -5,6 +5,42 @@
 PROJECT_TAG="dop-c02-lab"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
+# Untracked local settings (account IDs, profile names). This repo is public, so
+# nothing account-specific is committed -- copy .env.local.example to .env.local
+# and fill it in. Resolved from this file's own location so it works whatever the
+# caller's working directory is.
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${LIB_DIR}/../.env.local" ]; then
+  # shellcheck source=/dev/null
+  source "${LIB_DIR}/../.env.local"
+fi
+
+# Organization payer account. Credits pool here and Cost Explorer only reports
+# org-wide data from the management account, so cost/credit tooling must target
+# it -- a member account answers the same queries with narrower data and no
+# error, which is easy to miss. Only ops/ and cost tooling need these, so they
+# are validated lazily in require_payer_account rather than at source time.
+PAYER_ACCOUNT_ID="${PAYER_ACCOUNT_ID:-}"
+PAYER_PROFILE_DEFAULT="${PAYER_PROFILE_DEFAULT:-}"
+
+# Exits unless the caller is authenticated against the payer account.
+require_payer_account() {
+  if [ -z "$PAYER_ACCOUNT_ID" ]; then
+    echo "Error: PAYER_ACCOUNT_ID is not set." >&2
+    echo "Copy .env.local.example to .env.local and fill in your organization's values." >&2
+    exit 1
+  fi
+  local account
+  account="$(aws sts get-caller-identity --query Account --output text)"
+  echo "==> Account: $account (profile: ${AWS_PROFILE:-default})"
+  if [ "$account" != "$PAYER_ACCOUNT_ID" ]; then
+    echo "Error: expected payer account $PAYER_ACCOUNT_ID, got $account." >&2
+    echo "Cost Explorer would return only this account's data, not the organization's." >&2
+    echo "Re-run with: AWS_PROFILE=$PAYER_PROFILE_DEFAULT $0 $*" >&2
+    exit 1
+  fi
+}
+
 # Resource types worth a cost warning before deploying.
 COST_FLAG_PATTERN='AWS::EC2::NatGateway|AWS::RDS::|AWS::EKS::Cluster|AWS::ElastiCache::|AWS::Redshift::|AWS::OpenSearchService::|AWS::Elasticsearch::|AWS::MSK::|AWS::EC2::TransitGateway|AWS::GlobalAccelerator::|AWS::DirectConnect::'
 

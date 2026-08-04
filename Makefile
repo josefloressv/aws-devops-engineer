@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: new plan deploy apply destroy destroy-all base-plan base-deploy base-apply base-destroy-all help
+.PHONY: new plan deploy apply destroy destroy-all base-plan base-deploy base-apply base-destroy-all credit-check ops-apply help
 
 help:
 	@echo "Scenario lifecycle:"
@@ -16,6 +16,16 @@ help:
 	@echo "  make base-plan NAME=network"
 	@echo "  make base-deploy NAME=network"
 	@echo "  make base-destroy-all"
+	@echo ""
+	@echo "Cost:"
+	@echo "  make credit-check   # credit burn rate + projection to expiry (local, ad hoc)"
+	@echo '  make ops-apply NAME=credit-monitor PARAMS="NotificationEmail=you@example.com"'
+
+credit-check:
+	@scripts/credit-burn-check.sh
+
+ops-apply:
+	@scripts/ops-apply.sh "$(NAME)" $(PARAMS)
 
 new:
 	@scripts/lab-new.sh "$(DOMAIN)" "$(NAME)"
