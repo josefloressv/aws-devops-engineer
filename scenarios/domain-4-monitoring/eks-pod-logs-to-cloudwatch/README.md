@@ -10,7 +10,8 @@ empty set.
 
 This lab adds the forwarding path — the `amazon-cloudwatch-observability` EKS add-on,
 which runs Fluent Bit as a node-level DaemonSet — and re-runs the same four approaches
-against the same pod. It then deletes the pod and runs all four again.
+against the same pod, plus a fifth (Logs Insights) that only becomes possible once the
+log group exists. It then deletes the pod and runs all five again.
 
 The two READMEs are meant to be read as a pair. The first lab's "no logging configured"
 state is the control condition, which is why the forwarding path lives in a **separate**
@@ -25,8 +26,8 @@ raw terminal output is in [Observed output](#observed-output--run-of-2026-08-08)
 Three results are worth knowing before reading the captures, because two of them
 contradict reasonable expectations:
 
-- With the pod deleted, Approaches A, B and C all return "not found" while D still
-  returns the lines. See [Phase 2](#phase-2--after-kubectl-delete-pod).
+- With the pod deleted, Approaches A, B and C all return "not found" while D and E still
+  return the lines. See [Phase 2](#phase-2--after-kubectl-delete-pod).
 - **Deleting the forwarding stack does not revert Approach D to empty.** The log group
   and every event in it survive, because Fluent Bit creates the log group at runtime —
   it is not a resource in the stack, so CloudFormation never owned it and has nothing to
@@ -225,13 +226,33 @@ Pass `--max-items` to `filter-log-events`. Without it the CLI's auto-pagination 
 `--query` per page, so `--query 'length(events)'` prints one number per page
 (`0 0 0 1 0`) rather than a total.
 
+Approach E queries the same data as D through a different interface — run it in the
+console under **CloudWatch → Logs → Logs Insights**:
+
+```
+SOURCE "arn:aws:logs:us-east-1:<account-id>:log-group:/aws/containerinsights/dop-c02-lab-cluster/application" START=-1800s END=0s
+| fields @timestamp, @logStream, kubernetes.pod_id, log
+| filter kubernetes.pod_name = "crash-demo"
+| sort @timestamp desc
+| limit 100
+```
+
+Fluent Bit emits each line as JSON, so Logs Insights auto-discovers the nested keys and
+no `parse` is needed: `kubernetes.pod_name`, `kubernetes.container_name`,
+`kubernetes.namespace_name`, `kubernetes.pod_id`, plus `log`, `stream` and `time`. The
+raw application line is `log`; `@message` is the whole JSON envelope.
+
+Choose the time window deliberately. Once the pod is deep in `CrashLoopBackOff` the
+backoff interval reaches ~5 minutes, so a `START=-300s` window frequently returns zero or
+one restart and reads as though forwarding is broken.
+
 ### Phase 2 — the retention test
 
 ```sh
 kubectl delete pod crash-demo --force
 ```
 
-Then immediately re-run all four. Capture the current and previous container IDs
+Then immediately re-run all five. Capture the current and previous container IDs
 **before** deleting, since Approach C needs them afterwards:
 
 ```sh
@@ -409,6 +430,53 @@ Two events against a restart count of 7 — the five restarts that happened befo
 add-on was installed are not in CloudWatch. Every restart *after* the agent started was
 captured, including one whose container writes 4 lines and exits within ~2s.
 
+**E — CloudWatch Logs Insights** — exit 0. Query as above over a 1800s window,
+`Complete`, **32 records matched / 3429 scanned**:
+
+```
+2026-08-08 20:20:43.427 | CONTAINER STARTING - timestamp: Sat Aug  8 20:20:43 UTC 2026
+2026-08-08 20:20:43.427 | ERROR: Simulated application failure
+2026-08-08 20:20:43.427 | Stack trace line 1
+2026-08-08 20:20:43.427 | Stack trace line 2
+2026-08-08 20:15:25.401 | CONTAINER STARTING - timestamp: Sat Aug  8 20:15:25 UTC 2026
+...
+```
+
+32 records = 8 restarts × 4 lines, one log stream per restart.
+
+Two field-level caveats came out of this run, both of which affect how the output should
+be read:
+
+- **All four lines of a restart share one millisecond**, and Logs Insights does not order
+  reliably inside it — `sort @timestamp desc` returned `Stack trace line 2` above
+  `Stack trace line 1`. Sorting by Fluent Bit's nanosecond `time` field does **not** fix
+  it either; `2026-08-08T20:10:04.544344Z` sorted *after* `...544309871Z`, which is
+  backwards numerically, consistent with the field being truncated to milliseconds and
+  tie-broken arbitrarily. Use Logs Insights to find *which* restarts occurred; for line
+  order within one restart, read the raw stream (`kubectl logs`, `nerdctl logs`, or the
+  on-disk `/var/log/pods/.../N.log`, which carries full nanosecond precision).
+- **`kubernetes.docker_id` went stale.** It reported the same container across nine
+  restarts, while `@logStream` — which is derived from the log file path — tracked the
+  real one. Compared side by side over one 1800s window:
+
+  ```
+  time                     container id in @logStream   kubernetes.docker_id   match?
+  2026-08-08 20:20:43.427  52c3e7a95830                 578c55b720bc           NO
+  2026-08-08 20:15:25.401  1bbd910f798b                 578c55b720bc           NO
+  2026-08-08 20:10:04.544  9886d2cd07fa                 578c55b720bc           NO
+  2026-08-08 20:05:00.411  a9cab32d5968                 578c55b720bc           NO
+  2026-08-08 19:59:51.397  835bad47999a                 578c55b720bc           NO
+  2026-08-08 19:57:03.713  da947ce2e806                 578c55b720bc           NO
+  2026-08-08 19:55:33.416  a8f0a07dc35a                 578c55b720bc           NO
+  2026-08-08 19:54:44.403  578c55b720bc                 578c55b720bc           YES
+  ```
+
+  `578c55b720bc` is the first container Fluent Bit saw for that pod; its Kubernetes
+  metadata filter kept serving it for every later restart. `kubectl` independently
+  reported the current container as `52c3e7a95830...`, agreeing with `@logStream`. Group
+  by `@logStream` to count restarts or isolate one container instance —
+  `kubernetes.docker_id` will silently collapse them into one.
+
 ### Phase 2 — after `kubectl delete pod`
 
 ```
@@ -457,6 +525,31 @@ events: 2
    CONTAINER STARTING - timestamp: Sat Aug  8 19:32:23 UTC 2026
    CONTAINER STARTING - timestamp: Sat Aug  8 19:37:36 UTC 2026
 ```
+
+**E** — exit 0. A later run made the point more sharply. After the pod was deleted and a
+*new* `crash-demo` was applied, the cluster held only the new pod:
+
+```
+$ kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{" uid="}{.metadata.uid}{"\n"}{end}'
+crash-demo uid=1c6eef58-9b3e-475f-b045-43639079481b
+```
+
+Querying by the **deleted** pod's UID over a 4h window still returned its lines:
+
+```
+| filter kubernetes.pod_id = "f7e77d08-634e-4875-bb5a-dab3d6aa08ae"
+
+status: Complete | matched: 8
+2026-08-08 19:37:36.400 | CONTAINER STARTING - timestamp: Sat Aug  8 19:37:36 UTC 2026
+2026-08-08 19:37:36.400 | ERROR: Simulated application failure
+2026-08-08 19:37:36.400 | Stack trace line 1
+2026-08-08 19:37:36.400 | Stack trace line 2
+2026-08-08 19:32:23.415 | CONTAINER STARTING - timestamp: Sat Aug  8 19:32:23 UTC 2026
+...
+```
+
+That UID is not resolvable through any Kubernetes or node-level path — the pod object is
+gone from etcd and the node has no log files for it — yet it is still a usable query key.
 
 Both pod streams were still listed, including the final container instance that the node
 no longer has any trace of:
@@ -531,6 +624,7 @@ the first lab ([`eks-crashloop-log-retrieval`](../eks-crashloop-log-retrieval/RE
 | B | `kubectl describe pod crash-demo` | both strings, in the `Args:` spec block | both strings, in the `Args:` spec block | `NotFound`, exit 1 |
 | C | SSM → `nerdctl logs <id>` | both strings, exit 0 (`docker`/`crictl` absent) | both strings, exit 0 | `no such container`; pod log dir empty |
 | D | `aws logs filter-log-events` | no log group at all — empty result set | both strings, exit 0 | both strings, exit 0 |
+| E | Logs Insights query | no log group to select as `SOURCE` | both strings, exit 0 | both strings, exit 0 — queryable by the deleted pod's UID |
 
 And across the stack lifecycle:
 
