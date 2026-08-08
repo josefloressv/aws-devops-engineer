@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Minimal reusable EKS cluster used to observe how different tooling surfaces the
+  stdout/stderr of a container that has already crashed (CrashLoopBackOff).
+  Deliberately created WITHOUT control-plane log forwarding and WITHOUT any node
+  log agent, so that CloudWatch holds no application log data.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: dop-c02-lab-cluster
+    Description: Name of the EKS cluster. Also used to derive IAM role names.
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.36"
+    Description: >-
+      EKS control plane version. Only versions in EKS standard/extended support are
+      accepted; query the current list with
+      `aws eks describe-addon-versions --addon-name vpc-cni`.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC hosting the cluster. The default VPC is sufficient for this lab.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      At least two subnets in different Availability Zones. Avoid us-east-1e, which
+      does not support EKS control plane placement.
+
+  NodeInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: >-
+      Worker instance type. NOTE: t3.micro yields max-pods=4 (2 ENIs x 2 IPv4), which
+      is entirely consumed by aws-node + kube-proxy + one CoreDNS replica + one test
+      pod. Use t3.small (max-pods=11) or larger if this cluster is to be reused for
+      additional workloads.
+
+  NodegroupSize:
+    Type: Number
+    Default: 1
+    Description: Fixed node count (min = max = desired) to keep cost predictable.
+
+Resources:
+  # --- Control plane -------------------------------------------------------
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-cluster-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds: !Ref SubnetIds
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        # Grants the deploying principal cluster-admin, so kubectl works with the
+        # same SSO role that ran the stack -- no aws-auth ConfigMap editing needed.
+        BootstrapClusterCreatorAdminPermissions: true
+      # Logging is intentionally omitted. Enabling it here would ship control-plane
+      # component logs (api, audit, authenticator, ...) to CloudWatch -- but never
+      # container stdout/stderr. Leaving it off keeps Approach D unambiguous.
+
+  # --- Data plane ----------------------------------------------------------
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-node-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        # Not required to run the cluster. Added so the worker node registers with
+        # Systems Manager, which is the only way to reach a shell on the node in
+        # this account (managed nodegroups are created without an EC2 key pair).
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  Nodegroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub "${ClusterName}-ng"
+      NodeRole: !GetAtt NodeRole.Arn
+      AmiType: AL2023_x86_64_STANDARD
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      Subnets: !Ref SubnetIds
+      ScalingConfig:
+        MinSize: !Ref NodegroupSize
+        MaxSize: !Ref NodegroupSize
+        DesiredSize: !Ref NodegroupSize
+
+Outputs:
+  ClusterNameOut:
+    Description: Cluster name, for `aws eks update-kubeconfig --name`.
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+
+  ClusterEndpoint:
+    Description: Kubernetes API server endpoint.
+    Value: !GetAtt Cluster.Endpoint
+
+  NodeRoleArn:
+    Description: IAM role assumed by worker nodes.
+    Value: !GetAtt NodeRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-NodeRoleArn"
+
+  UpdateKubeconfigCommand:
+    Description: Copy/paste to point kubectl at this cluster.
+    Value: !Sub "aws eks update-kubeconfig --name ${Cluster} --region ${AWS::Region}"
