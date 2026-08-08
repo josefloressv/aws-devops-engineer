@@ -49,6 +49,19 @@ regardless of the language the conversation happens in.
 - If a stack ends up in `ROLLBACK_COMPLETE`, `scripts/lab-plan.sh`/`base-plan.sh` will now stop
   and tell you to delete it first — CloudFormation refuses an `UPDATE` change set against that
   status.
+- Any resource that CloudFormation **replaces** (create-first, delete-second) will collide with
+  itself if the template pins an explicit name. Hit on `AWS::EKS::Nodegroup` with
+  `NodegroupName` set: changing `InstanceTypes` failed with `NodeGroup already exists with name
+  ... (Status Code: 409)` / `HandlerErrorCode: AlreadyExists` and rolled back. Leave the name
+  property unset so CloudFormation auto-generates it, unless a stable name is actually needed.
+  The rollback is clean (the original resource keeps running), but the update does not apply.
+- A role owned by another stack cannot have `ManagedPolicyArns` appended to it from a second
+  stack. Attach from the other direction instead: an `AWS::IAM::ManagedPolicy` in the consuming
+  stack listing the imported role in its own `Roles` property.
+- CloudWatch **log groups created at runtime by an agent** (e.g. Fluent Bit via the
+  `amazon-cloudwatch-observability` add-on) are not CloudFormation resources. Deleting the stack
+  that installed the agent stops new logs but leaves the groups, their events and their
+  retention in place — and they keep billing. Delete them explicitly in teardown.
 
 ## Deploy workflow — auto-apply by default, pause only for cost-flagged resources
 

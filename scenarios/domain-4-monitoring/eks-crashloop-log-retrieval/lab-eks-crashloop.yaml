@@ -104,7 +104,12 @@ Resources:
     Type: AWS::EKS::Nodegroup
     Properties:
       ClusterName: !Ref Cluster
-      NodegroupName: !Sub "${ClusterName}-ng"
+      # NodegroupName is deliberately NOT set, so CloudFormation generates one.
+      # Changing InstanceTypes replaces the nodegroup, and CloudFormation replaces
+      # create-first/delete-second -- with a fixed name the create leg fails with
+      # "NodeGroup already exists ... (Status Code: 409)". An auto-generated name
+      # lets NodeInstanceType be raised (e.g. t3.micro -> t3.small for max-pods) in
+      # a normal stack update.
       NodeRole: !GetAtt NodeRole.Arn
       AmiType: AL2023_x86_64_STANDARD
       InstanceTypes:

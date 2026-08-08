@@ -12,6 +12,12 @@ correct — compare the captured output yourself. A full run was executed on 202
 the raw terminal output of all four approaches is in
 [Observed output](#observed-output--run-of-2026-08-08).
 
+This cluster is created with **no log forwarding**, which is the control condition for the
+follow-on lab
+[`eks-pod-logs-to-cloudwatch`](../eks-pod-logs-to-cloudwatch/README.md). That lab installs
+the CloudWatch Observability add-on into this same cluster, re-runs these four approaches,
+and then deletes the pod — read the two together for the before/after.
+
 Three environment behaviours from that run are worth knowing before you read the
 captures, because each one changes what a given approach can return:
 
@@ -110,6 +116,14 @@ redeploying:
   Do this *before* `kubectl apply -f crash-pod.yaml`. To reuse this cluster for anything
   else, raise `NodeInstanceType` to `t3.small` (`max-pods=11`) instead — at `t3.micro`
   there is exactly one free pod slot in the whole cluster.
+
+  Raising it is a normal stack update, but note that changing `InstanceTypes` **replaces**
+  the nodegroup, and CloudFormation replaces create-first/delete-second. `NodegroupName`
+  is therefore deliberately left unset in this template so CloudFormation auto-generates
+  it — with a fixed name the create leg fails with `NodeGroup already exists ... (Status
+  Code: 409)` and the update rolls back. The rollback is clean (the original node keeps
+  running), but the update does not apply. See the follow-on lab's
+  [capacity section](../eks-pod-logs-to-cloudwatch/README.md#prerequisite-node-capacity).
 - **`AmazonSSMManagedInstanceCore` on the node role.** Not needed to run Kubernetes, but
   Approach C requires a shell on the worker node, and managed nodegroups launch without
   an EC2 key pair. SSM is the only route in.
@@ -122,7 +136,9 @@ redeploying:
 only ship *control-plane component* logs (`api`, `audit`, `authenticator`,
 `controllerManager`, `scheduler`) — never container stdout/stderr, which reaches
 CloudWatch only via a node-level agent such as Fluent Bit in CloudWatch Container
-Insights.
+Insights. The follow-on lab
+[`eks-pod-logs-to-cloudwatch`](../eks-pod-logs-to-cloudwatch/README.md) adds exactly that
+agent and re-runs Approach D against it.
 
 ## Test procedure
 
