@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crash-demo
+  labels:
+    app: crash-demo
+spec:
+  containers:
+    - name: crash-container
+      image: busybox
+      command: ["sh", "-c"]
+      args:
+        - |
+          echo "CONTAINER STARTING - timestamp: $(date)"
+          echo "ERROR: Simulated application failure"
+          echo "Stack trace line 1"
+          echo "Stack trace line 2"
+          sleep 2
+          exit 1
