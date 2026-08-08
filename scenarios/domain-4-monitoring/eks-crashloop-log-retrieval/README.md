@@ -43,9 +43,10 @@ cluster is no longer being reused.
 
 ## Deploy
 
-The stack name and cluster name are fixed by the lab brief rather than derived from the
-repo's `dop-lab-d<n>-<slug>` convention, so this scenario is deployed with the CLI
-directly instead of `make apply`. The change-set workflow is unchanged.
+This scenario uses the stack name `dop-c02-lab-eks` and cluster name
+`dop-c02-lab-cluster` rather than the repo's `dop-lab-d<n>-<slug>` convention, so it
+deploys with the CLI directly instead of `make apply`. The change-set workflow is
+unchanged.
 
 ```sh
 export AWS_PROFILE="$LAB_PROFILE" AWS_REGION=us-east-1   # lab account profile, see .env.local
@@ -87,10 +88,13 @@ running.
 
 ## Deployment notes
 
-Three things differ from a naive reading of the brief, each forced by the environment:
+Four properties of this environment shape what the lab can do. Read them before
+redeploying:
 
-- **Kubernetes version.** EKS no longer offers 1.29. This account reports `1.31`–`1.36`
-  as available; the lab runs the latest, `1.36`. Re-check before redeploying later:
+- **Kubernetes version.** The template defaults to `1.36`, the newest version EKS offered
+  at the time of the run. EKS retires versions continuously, so a redeploy months from
+  now may find `1.36` gone from standard support. Check the current list and override
+  `KubernetesVersion` if needed:
   `aws eks describe-addon-versions --addon-name vpc-cni \
   --query 'addons[0].addonVersions[0].compatibilities[].clusterVersion'`.
 - **`t3.micro` capacity — needs a manual step.** The EKS CNI derives `max-pods` from ENI
@@ -109,11 +113,10 @@ Three things differ from a naive reading of the brief, each forced by the enviro
 - **`AmazonSSMManagedInstanceCore` on the node role.** Not needed to run Kubernetes, but
   Approach C requires a shell on the worker node, and managed nodegroups launch without
   an EC2 key pair. SSM is the only route in.
-
-A fourth difference surfaced only at test time: **this AMI ships no `crictl`**. The
-EKS-optimized AL2023 image for 1.36 carries `ctr` and `nerdctl` but neither `docker` nor
-`crictl`, so the conventional `crictl ps -a` / `crictl logs` recipe fails outright. See
-Approach C below for the full tool inventory.
+- **No `crictl` on the AMI.** The EKS-optimized AL2023 image for 1.36 carries `ctr` and
+  `nerdctl` but neither `docker` nor `crictl`, so the conventional `crictl ps -a` /
+  `crictl logs` recipe fails outright. This surfaced only at test time. See Approach C
+  for the full tool inventory.
 
 `Logging` is deliberately left unset on `AWS::EKS::Cluster`. Note that enabling it would
 only ship *control-plane component* logs (`api`, `audit`, `authenticator`,
