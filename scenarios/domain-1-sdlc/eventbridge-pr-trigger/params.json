@@ -1,0 +1,5 @@
+[
+  { "ParameterKey": "PipelineStackName", "ParameterValue": "dop-lab-d1-codepipeline-artifacts-and-reports" },
+  { "ParameterKey": "RepositoryName", "ParameterValue": "dop-c02-sdlc" },
+  { "ParameterKey": "LogRetentionDays", "ParameterValue": "1" }
+]

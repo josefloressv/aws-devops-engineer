@@ -1,0 +1,410 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DOP-C02 Domain 1 - core SDLC pipeline. Builds the CodePipeline / CodeBuild /
+  IAM plumbing that produces the evidence for: reports vs artifacts, secondary
+  artifacts, TemplateConfiguration, buildspec phase ordering, and a test action
+  acting as a gate. The application source lives in a separate repository.
+
+Parameters:
+  SourceProvider:
+    Type: String
+    Default: CodeStarSourceConnection
+    AllowedValues:
+      - CodeStarSourceConnection
+      - CodeCommit
+      - S3
+    Description: >
+      Which AWS-owned Source provider the pipeline uses. All three are encoded
+      below so the deployed source configuration can be compared against the
+      other two without editing the template.
+
+  GitHubConnectionArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /dop-c02-lab/github-connection-arn
+    Description: >
+      SSM path holding the CodeConnections ARN. Resolved at deploy time so the
+      account ID never lands in this public repository.
+
+  GitHubRepositoryId:
+    Type: String
+    Default: josefloressv/aws-devops-sdlc-automation
+    Description: owner/repo for the CodeStarSourceConnection provider.
+
+  CodeCommitRepositoryName:
+    Type: String
+    Default: dop-c02-sdlc
+
+  SourceBucketName:
+    Type: String
+    Default: ""
+    Description: Only read when SourceProvider is S3.
+
+  SourceObjectKey:
+    Type: String
+    Default: source.zip
+
+  BranchName:
+    Type: String
+    Default: main
+
+  AppStackPrefix:
+    Type: String
+    Default: dop-c02-app
+    Description: Deploy actions and IAM scoping both key off this prefix.
+
+Conditions:
+  UseGitHub: !Equals [!Ref SourceProvider, CodeStarSourceConnection]
+  UseCodeCommit: !Equals [!Ref SourceProvider, CodeCommit]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Artifact store. Versioning is not optional - CodePipeline requires it.
+  # No BucketName: a generated name avoids global-namespace collisions.
+  # ---------------------------------------------------------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------------------------------------------------------------------------
+  # IAM. No RoleName / ManagedPolicyName anywhere: scripts/lib.sh only passes
+  # CAPABILITY_IAM, so named IAM resources would fail the change set.
+  # Inline Policies[].PolicyName is unaffected -- it is a required property and
+  # does not make the role a named IAM resource.
+  # ---------------------------------------------------------------------------
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource:
+                  - !GetAtt BuildProject.Arn
+                  - !GetAtt IntegrationTestProject.Arn
+              - Effect: Allow
+                Action: cloudformation:*
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackPrefix}-*/*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationDeployRole.Arn
+              - Effect: Allow
+                Action:
+                  - codeconnections:UseConnection
+                  - codestar-connections:UseConnection
+                Resource: !Ref GitHubConnectionArn
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetRepository
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                Resource: !Sub "arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepositoryName}"
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackPrefix}-*/*"
+              # Without these five the reports: section in the buildspec produces
+              # nothing at all, silently. They are the mechanism, not a detail.
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource: !Sub "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/*"
+
+  CloudFormationDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: app-deploy-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:*
+                  - apigateway:*
+                  - logs:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:ListRoleTags
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudformation:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild
+  # ---------------------------------------------------------------------------
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: dop-c02-build
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+
+  IntegrationTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: dop-c02-integration-test
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-integration.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # Pipeline
+  # ---------------------------------------------------------------------------
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: dop-c02-sdlc-pipeline
+      PipelineType: V1
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: "1"
+                Provider: !If
+                  - UseGitHub
+                  - CodeStarSourceConnection
+                  - !If [UseCodeCommit, CodeCommit, S3]
+              Configuration: !If
+                - UseGitHub
+                - ConnectionArn: !Ref GitHubConnectionArn
+                  FullRepositoryId: !Ref GitHubRepositoryId
+                  BranchName: !Ref BranchName
+                  DetectChanges: true
+                - !If
+                  - UseCodeCommit
+                  - RepositoryName: !Ref CodeCommitRepositoryName
+                    BranchName: !Ref BranchName
+                    PollForSourceChanges: false
+                  - S3Bucket: !Ref SourceBucketName
+                    S3ObjectKey: !Ref SourceObjectKey
+                    PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              # These names must match the secondary-artifacts keys in
+              # buildspec.yml exactly, or the build fails at artifact upload.
+              OutputArtifacts:
+                - Name: TemplateArtifact
+                - Name: ImageDefsArtifact
+              RunOrder: 1
+
+        - Name: DeployDev
+          Actions:
+            - Name: DeployDev
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: "1"
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub "${AppStackPrefix}-dev"
+                TemplatePath: TemplateArtifact::infra/app-template.yaml
+                TemplateConfiguration: TemplateArtifact::params/dev.json
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+                RoleArn: !GetAtt CloudFormationDeployRole.Arn
+              InputArtifacts:
+                - Name: TemplateArtifact
+              RunOrder: 1
+
+        - Name: DeployStaging
+          Actions:
+            - Name: DeployStaging
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: "1"
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub "${AppStackPrefix}-staging"
+                TemplatePath: TemplateArtifact::infra/app-template.yaml
+                TemplateConfiguration: TemplateArtifact::params/staging.json
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+                RoleArn: !GetAtt CloudFormationDeployRole.Arn
+              InputArtifacts:
+                - Name: TemplateArtifact
+              RunOrder: 1
+
+        - Name: IntegrationTest
+          Actions:
+            - Name: IntegrationTest
+              ActionTypeId:
+                Category: Test
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref IntegrationTestProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: ApproveProd
+          Actions:
+            - Name: ApproveProd
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Version: "1"
+                Provider: Manual
+              Configuration:
+                CustomData: !Sub "Approve promotion to ${AppStackPrefix}-prod"
+              RunOrder: 1
+
+Outputs:
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactBucketName"
+  PipelineName:
+    Value: !Ref Pipeline
+    Export:
+      Name: !Sub "${AWS::StackName}-PipelineName"
+  PipelineArn:
+    Value: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}"
+    Export:
+      Name: !Sub "${AWS::StackName}-PipelineArn"
+  BuildProjectName:
+    Value: !Ref BuildProject
+    Export:
+      Name: !Sub "${AWS::StackName}-BuildProjectName"
+  CodeBuildServiceRoleArn:
+    Value: !GetAtt CodeBuildServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeBuildServiceRoleArn"
+  DeployedSourceProvider:
+    Value: !Ref SourceProvider

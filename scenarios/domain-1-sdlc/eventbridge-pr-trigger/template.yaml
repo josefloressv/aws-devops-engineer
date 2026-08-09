@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  DOP-C02 Domain 1 - EventBridge rules that react to CodeCommit pull request
+  state changes. One rule starts the Phase 1 pipeline and logs the matched
+  event; a second rule matches a different detail.event value and only logs,
+  to give a contrast case for event-pattern matching.
+
+Parameters:
+  PipelineStackName:
+    Type: String
+    Default: dop-lab-d1-codepipeline-artifacts-and-reports
+    Description: >-
+      Stack name of the Phase 1 pipeline scenario. Its exports supply the
+      pipeline name and ARN this stack targets.
+
+  RepositoryName:
+    Type: String
+    Default: dop-c02-sdlc
+    Description: CodeCommit repository whose pull request events are matched.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 1
+    AllowedValues: [1, 3, 5, 7, 14, 30]
+    Description: Retention for the two event-capture log groups.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Log targets. Both rules write the raw matched event here, which is the only
+  # way to see the event body EventBridge actually matched against.
+  # ---------------------------------------------------------------------------
+  PrTriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/events/dop-c02-pr-trigger
+      RetentionInDays: !Ref LogRetentionDays
+
+  PrClosedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/events/dop-c02-pr-trigger-closed
+      RetentionInDays: !Ref LogRetentionDays
+
+  # A resource policy is required for EventBridge to deliver into a log group.
+  # This is delivery permission on the LOG GROUP, not on the rule -- unlike the
+  # pipeline target, it does not use the rule's RoleArn.
+  EventsToLogsPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: dop-c02-pr-trigger-events-to-logs
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowEventBridgeToPutLogEvents",
+              "Effect": "Allow",
+              "Principal": { "Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"] },
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": [
+                "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/dop-c02-pr-trigger:*",
+                "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/dop-c02-pr-trigger-closed:*"
+              ],
+              "Condition": {
+                "ArnLike": {
+                  "aws:SourceArn": "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+                }
+              }
+            }
+          ]
+        }
+
+  # ---------------------------------------------------------------------------
+  # The pipeline target DOES need a role. Name is left unset: scripts/lib.sh
+  # passes only CAPABILITY_IAM, so a named IAM resource would be rejected.
+  # ---------------------------------------------------------------------------
+  EventsInvokePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # PolicyName is required on an inline policy. It does not make this a
+        # "named IAM resource" -- only RoleName / ManagedPolicyName do that.
+        - PolicyName: start-pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource:
+                  Fn::ImportValue: !Sub "${PipelineStackName}-PipelineArn"
+
+  # ---------------------------------------------------------------------------
+  # Rule 1 - matches PR creation and source-branch updates. Two targets.
+  # ---------------------------------------------------------------------------
+  PrTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: dop-c02-pr-trigger
+      Description: >-
+        Starts the Phase 1 pipeline when a pull request is created or its
+        source branch is updated, and logs the raw matched event.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Pull Request State Change
+        resources:
+          - !Sub "arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}"
+        detail:
+          event:
+            - pullRequestCreated
+            - pullRequestSourceBranchUpdated
+      Targets:
+        - Id: StartPipeline
+          Arn:
+            Fn::ImportValue: !Sub "${PipelineStackName}-PipelineArn"
+          RoleArn: !GetAtt EventsInvokePipelineRole.Arn
+        - Id: LogMatchedEvent
+          Arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${PrTriggerLogGroup}"
+
+  # ---------------------------------------------------------------------------
+  # Rule 2 - contrast case. Same source and detail-type, different detail.event,
+  # and no pipeline target. Exists so a non-matching event for rule 1 can be
+  # shown landing somewhere rather than vanishing.
+  # ---------------------------------------------------------------------------
+  PrClosedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: dop-c02-pr-trigger-closed
+      Description: >-
+        Logs pull request status changes only. No pipeline target.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Pull Request State Change
+        detail:
+          event:
+            - pullRequestStatusChanged
+      Targets:
+        - Id: LogMatchedEvent
+          Arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${PrClosedLogGroup}"
+
+Outputs:
+  PrTriggerRuleName:
+    Value: !Ref PrTriggerRule
+    Export:
+      Name: !Sub "${AWS::StackName}-PrTriggerRuleName"
+  PrTriggerRuleArn:
+    Value: !GetAtt PrTriggerRule.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-PrTriggerRuleArn"
+  PrClosedRuleName:
+    Value: !Ref PrClosedRule
+    Export:
+      Name: !Sub "${AWS::StackName}-PrClosedRuleName"
+  PrTriggerLogGroupName:
+    Value: !Ref PrTriggerLogGroup
+  PrClosedLogGroupName:
+    Value: !Ref PrClosedLogGroup
+  TargetedPipelineName:
+    Value:
+      Fn::ImportValue: !Sub "${PipelineStackName}-PipelineName"

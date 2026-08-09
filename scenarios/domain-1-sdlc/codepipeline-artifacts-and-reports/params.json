@@ -1,0 +1,6 @@
+[
+  { "ParameterKey": "SourceProvider", "ParameterValue": "CodeStarSourceConnection" },
+  { "ParameterKey": "GitHubRepositoryId", "ParameterValue": "josefloressv/aws-devops-sdlc-automation" },
+  { "ParameterKey": "BranchName", "ParameterValue": "main" },
+  { "ParameterKey": "CodeCommitRepositoryName", "ParameterValue": "dop-c02-sdlc" }
+]
