@@ -1,0 +1,315 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  DOP-C02 Domain 1 - a pipeline whose Build action emits TWO output artifacts and
+  whose Deploy action consumes three inputs. Deploys to the existing EKS cluster.
+  The deploy project reaches the cluster through an EKS access entry, not aws-auth.
+
+Parameters:
+  PipelineStackName:
+    Type: String
+    Default: dop-lab-d1-codepipeline-artifacts-and-reports
+    Description: >-
+      Stack whose artifact bucket this pipeline reuses. CodePipeline needs a
+      versioned bucket; there is no reason to create a second one.
+
+  ClusterName:
+    Type: String
+    Default: dop-c02-lab-cluster
+    Description: Existing EKS cluster. This stack creates no cluster and no nodes.
+
+  CodeCommitRepositoryName:
+    Type: String
+    Default: dop-c02-sdlc
+
+  BranchName:
+    Type: String
+    Default: main
+
+  EcrRepositoryName:
+    Type: String
+    Default: dop-c02-lab
+    Description: Shared with the ECS blue/green scenario; not created here.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # IAM. No RoleName / ManagedPolicyName anywhere -- scripts/lib.sh passes only
+  # CAPABILITY_IAM. Inline Policies[].PolicyName is required and is unaffected.
+  # ---------------------------------------------------------------------------
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: eks-build-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue
+                        Fn::Sub: "${PipelineStackName}-ArtifactBucketName"
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue
+                        Fn::Sub: "${PipelineStackName}-ArtifactBucketName"
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: eks-deploy-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              # DescribeCluster is what update-kubeconfig calls. It is an IAM
+              # permission. Being allowed to call it says nothing about whether
+              # kubectl will be authorized -- that is the access entry below.
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                Resource: !Sub "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue
+                        Fn::Sub: "${PipelineStackName}-ArtifactBucketName"
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue
+                        Fn::Sub: "${PipelineStackName}-ArtifactBucketName"
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: eks-pipeline-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue
+                        Fn::Sub: "${PipelineStackName}-ArtifactBucketName"
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue
+                        Fn::Sub: "${PipelineStackName}-ArtifactBucketName"
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetRepository
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                Resource: !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepositoryName}"
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource:
+                  - !GetAtt BuildProject.Arn
+                  - !GetAtt DeployProject.Arn
+
+  # ---------------------------------------------------------------------------
+  # Cluster authorization. The cluster is on API_AND_CONFIG_MAP, so the deploy
+  # role is granted Kubernetes rights with an access entry instead of an
+  # aws-auth ConfigMap edit.
+  # ---------------------------------------------------------------------------
+  DeployAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref ClusterName
+      PrincipalArn: !GetAtt DeployRole.Arn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild
+  # ---------------------------------------------------------------------------
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: dop-c02-eks-build
+      ServiceRole: !GetAtt BuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: eks/buildspec-eks.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        # Required to run docker build inside the build container.
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REGISTRY
+            Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
+
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: dop-c02-eks-deploy
+      ServiceRole: !GetAtt DeployRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: eks/buildspec-eks-deploy.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: CLUSTER_NAME
+            Value: !Ref ClusterName
+
+  # ---------------------------------------------------------------------------
+  # Pipeline. Build emits two output artifacts; Deploy declares three inputs and
+  # names one of them as the primary source.
+  # ---------------------------------------------------------------------------
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: dop-c02-eks-pipeline
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !ImportValue
+          Fn::Sub: "${PipelineStackName}-ArtifactBucketName"
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: "1"
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                RepositoryName: !Ref CodeCommitRepositoryName
+                BranchName: !Ref BranchName
+                # Started by hand for this lab, so no change-detection rule.
+                PollForSourceChanges: false
+
+        - Name: Build
+          Actions:
+            - Name: BuildImageAndManifests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceArtifact
+              # The names must match the secondary-artifacts keys in
+              # eks/buildspec-eks.yml exactly, or the action fails.
+              OutputArtifacts:
+                - Name: ManifestArtifact
+                - Name: ImageDefArtifact
+              Configuration:
+                ProjectName: !Ref BuildProject
+              RunOrder: 1
+
+        - Name: DeployToEks
+          Actions:
+            - Name: KubectlApply
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceArtifact
+                - Name: ManifestArtifact
+                - Name: ImageDefArtifact
+              Configuration:
+                ProjectName: !Ref DeployProject
+                # With more than one input, CodeBuild must be told which one is
+                # $CODEBUILD_SRC_DIR. The others land in
+                # $CODEBUILD_SRC_DIR_<ArtifactName>.
+                PrimarySource: SourceArtifact
+              RunOrder: 1
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+    Export:
+      Name: !Sub "${AWS::StackName}-PipelineName"
+  BuildProjectName:
+    Value: !Ref BuildProject
+  DeployProjectName:
+    Value: !Ref DeployProject
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn

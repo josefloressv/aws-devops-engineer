@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  DOP-C02 Domain 1 - ECS blue/green deployment driven by CodeDeploy. An ALB with
+  a production listener and a separate test listener, two target groups, a
+  Fargate service whose deployment controller is CODE_DEPLOY, and a deployment
+  group configured for linear traffic shifting with alarm-based auto-rollback.
+
+Parameters:
+  BaseNetworkStackName:
+    Type: String
+    Default: dop-lab-base-network
+    Description: >-
+      Base network stack supplying the VPC and the two public subnets. The ALB
+      and the Fargate tasks both land in the public subnets; tasks get a public
+      IP so no NAT Gateway is needed.
+
+  ImageRepositoryName:
+    Type: String
+    Default: dop-c02-lab
+    Description: >-
+      ECR repository already seeded with :blue and :green by seed-images.sh.
+      Not created here, because the EKS scenario reuses the same repository.
+
+  InitialImageTag:
+    Type: String
+    Default: blue
+    Description: Tag the first task definition revision points at.
+
+  ContainerName:
+    Type: String
+    Default: app
+    Description: >-
+      Must match ContainerName in ecs/appspec.yaml. CodeDeploy uses this name to
+      find the load balancer target inside the new task definition.
+
+  ProdListenerPort:
+    Type: Number
+    Default: 80
+  TestListenerPort:
+    Type: Number
+    Default: 8080
+
+  Alarm5xxThreshold:
+    Type: Number
+    Default: 5
+    Description: >-
+      HTTPCode_ELB_5XX_Count is a load-balancer-wide metric, so 5XX served on the
+      TEST listener counts against the PROD rollback trigger too. At a threshold
+      of 1 a single probe of an empty target group stops the next deployment.
+  Alarm5xxEvaluationPeriods:
+    Type: Number
+    Default: 2
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Networking
+  # ---------------------------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Inbound to the ALB on the production and test listeners
+      VpcId:
+        Fn::ImportValue: !Sub "${BaseNetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ProdListenerPort
+          ToPort: !Ref ProdListenerPort
+          CidrIp: 0.0.0.0/0
+          Description: Production listener
+        - IpProtocol: tcp
+          FromPort: !Ref TestListenerPort
+          ToPort: !Ref TestListenerPort
+          CidrIp: 0.0.0.0/0
+          Description: Test listener - lets the green version be probed before it takes prod traffic
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate tasks, reachable only from the ALB
+      VpcId:
+        Fn::ImportValue: !Sub "${BaseNetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: Container port, ALB only
+
+  # ---------------------------------------------------------------------------
+  # ALB. Two target groups and two listeners: CodeDeploy swaps which target group
+  # each listener forwards to. Target type must be ip for awsvpc networking.
+  # ---------------------------------------------------------------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - Fn::ImportValue: !Sub "${BaseNetworkStackName}-PublicSubnet1Id"
+        - Fn::ImportValue: !Sub "${BaseNetworkStackName}-PublicSubnet2Id"
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  TargetGroupBlue:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub "${BaseNetworkStackName}-VpcId"
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "5"
+
+  TargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub "${BaseNetworkStackName}-VpcId"
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "5"
+
+  ProdListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref ProdListenerPort
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupBlue
+
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref TestListenerPort
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupGreen
+
+  # ---------------------------------------------------------------------------
+  # ECS
+  # ---------------------------------------------------------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/dop-c02-lab
+      RetentionInDays: 1
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: dop-c02-lab-ecs
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: dop-c02-lab-task
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref ContainerName
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ImageRepositoryName}:${InitialImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ProdListener
+      - TestListener
+    Properties:
+      ServiceName: dop-c02-lab-svc
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      # CODE_DEPLOY, not ECS. With the default ECS controller the service does a
+      # rolling update itself and CodeDeploy cannot drive it at all.
+      DeploymentController:
+        Type: CODE_DEPLOY
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - Fn::ImportValue: !Sub "${BaseNetworkStackName}-PublicSubnet1Id"
+            - Fn::ImportValue: !Sub "${BaseNetworkStackName}-PublicSubnet2Id"
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Ref ContainerName
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroupBlue
+
+  # ---------------------------------------------------------------------------
+  # Alarm used as a rollback trigger.
+  # ---------------------------------------------------------------------------
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: dop-c02-ecs-5xx
+      AlarmDescription: ALB 5XX responses. Wired into the deployment group as a rollback trigger.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt LoadBalancer.LoadBalancerFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: !Ref Alarm5xxEvaluationPeriods
+      DatapointsToAlarm: !Ref Alarm5xxEvaluationPeriods
+      Threshold: !Ref Alarm5xxThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # ---------------------------------------------------------------------------
+  # CodeDeploy
+  # ---------------------------------------------------------------------------
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: dop-c02-ecs-app
+      ComputePlatform: ECS
+
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: dop-c02-ecs-dg
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      DeploymentConfigName: CodeDeployDefault.ECSLinear10PercentEvery1Minutes
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5
+      ECSServices:
+        - ClusterName: !Ref Cluster
+          ServiceName: !GetAtt Service.Name
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - ProdTrafficRoute:
+              ListenerArns:
+                - !Ref ProdListener
+            TestTrafficRoute:
+              ListenerArns:
+                - !Ref TestListener
+            TargetGroups:
+              - Name: !GetAtt TargetGroupBlue.TargetGroupName
+              - Name: !GetAtt TargetGroupGreen.TargetGroupName
+      AlarmConfiguration:
+        Enabled: true
+        Alarms:
+          - Name: !Ref Alb5xxAlarm
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_ALARM
+
+Outputs:
+  LoadBalancerDns:
+    Value: !GetAtt LoadBalancer.DNSName
+  ProdUrl:
+    Value: !Sub "http://${LoadBalancer.DNSName}:${ProdListenerPort}/"
+  TestUrl:
+    Value: !Sub "http://${LoadBalancer.DNSName}:${TestListenerPort}/"
+  ProdListenerArn:
+    Value: !Ref ProdListener
+  TestListenerArn:
+    Value: !Ref TestListener
+  TargetGroupBlueArn:
+    Value: !Ref TargetGroupBlue
+  TargetGroupGreenArn:
+    Value: !Ref TargetGroupGreen
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+  AlarmName:
+    Value: !Ref Alb5xxAlarm

@@ -62,6 +62,34 @@ regardless of the language the conversation happens in.
   `amazon-cloudwatch-observability` add-on) are not CloudFormation resources. Deleting the stack
   that installed the agent stops new logs but leaves the groups, their events and their
   retention in place — and they keep billing. Delete them explicitly in teardown.
+- `scripts/lib.sh:create_changeset` passes only `--capabilities CAPABILITY_IAM`. A scenario
+  template that sets `RoleName` or `ManagedPolicyName` is a *named* IAM resource and needs
+  `CAPABILITY_NAMED_IAM`, so it fails change-set creation. Leave both unset.
+- Inline `Policies[].PolicyName` is the opposite case: it is **required**, and it does *not*
+  make the role a named IAM resource. Omitting it fails change-set creation with
+  `AWS::EarlyValidation::PropertyValidation`, which reports neither a property name nor a
+  resource — `describe-stack-events` and `describe-change-set-hooks` show nothing either. The
+  only way to find it is to bisect the template into single-resource probes.
+- `COST_FLAG_PATTERN` is a plain `grep` over the template text, so it matches inside comments
+  too. Writing "no NAT Gateway is needed (`AWS::EC2::NatGateway`)" in a comment flags a stack
+  that creates nothing costly.
+- In a buildspec written as YAML, a command containing `: ` (colon-space) is parsed as a
+  mapping, not a string. Quote the whole command or use `>-`.
+- `aws events put-events` rejects any entry whose `Source` starts with `aws.` with
+  `NotAuthorizedForSourceException`. The prefix is reserved for genuine service events, so
+  AWS-service event patterns cannot be exercised with synthetic events — use a real event.
+- `aws codepipeline get-pipeline-state` returns the last-known status **per stage**, which may
+  belong to an older execution. To ask "what did *this* execution do", use
+  `list-action-executions --filter pipelineExecutionId=...`; a stage that never ran in that
+  execution simply has no rows.
+- In **zsh**, `"$FN:live"` applies the `:l` history modifier (lowercase) and yields
+  `<lowercased-fn>ive`. Any ARN-ish string built as `$VAR:letter` needs `"${VAR}:live"`.
+- A newly created `AWS::CodePipeline::Pipeline` **runs itself once** the moment it is created,
+  with `trigger.triggerType = CreatePipeline` and no source change. Expect a phantom first
+  execution in `list-pipeline-executions` and don't attribute it to whatever you did next.
+- ALB `HTTPCode_ELB_5XX_Count` is only published when it is non-zero. An alarm on it with
+  `TreatMissingData: notBreaching` does **not** reliably self-clear once it fires, because no
+  further datapoints arrive — release it with `aws cloudwatch set-alarm-state --state-value OK`.
 
 ## Deploy workflow — auto-apply by default, pause only for cost-flagged resources
 

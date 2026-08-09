@@ -1,0 +1,10 @@
+[
+  { "ParameterKey": "BaseNetworkStackName", "ParameterValue": "dop-lab-base-network" },
+  { "ParameterKey": "ImageRepositoryName", "ParameterValue": "dop-c02-lab" },
+  { "ParameterKey": "InitialImageTag", "ParameterValue": "blue" },
+  { "ParameterKey": "ContainerName", "ParameterValue": "app" },
+  { "ParameterKey": "ProdListenerPort", "ParameterValue": "80" },
+  { "ParameterKey": "TestListenerPort", "ParameterValue": "8080" },
+  { "ParameterKey": "Alarm5xxThreshold", "ParameterValue": "5" },
+  { "ParameterKey": "Alarm5xxEvaluationPeriods", "ParameterValue": "2" }
+]
